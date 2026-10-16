@@ -8,9 +8,9 @@ which makes adding a new detector a 10-15 line change.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, Optional, Sequence
 
 from auditcraft.core.sloc_counter import DEFAULT_EXCLUDES, SUPPORTED_EXTS
 from auditcraft.models.issue import CheckFinding, CheckResult, Severity
@@ -58,7 +58,7 @@ def rule(
     return decorator
 
 
-def _language_of(path: Path) -> Optional[str]:
+def _language_of(path: Path) -> str | None:
     ext = path.suffix.lower()
     if ext == ".sol":
         return "solidity"
@@ -167,6 +167,152 @@ def _rs002(path: Path, text: str) -> Iterable[tuple[int, str]]:
 
 
 # ---------------------------------------------------------------------------
+# Extended Solidity rules (v0.2.0)
+# ---------------------------------------------------------------------------
+
+_EXTERNAL_CALL = re.compile(r"\.(?:call|transfer|send)\s*[\\({]")
+_STATE_WRITE = re.compile(r"^\s*(?:[A-Za-z_]\w*\s*(?:\[[^\]]*\])?\s*(?:=|\+=|-=|\*=|/=|\+\+|--))")
+_NON_REENTRANT = re.compile(r"\bnonReentrant\b")
+
+
+@rule(
+    "SC006",
+    "Reentrancy risk: state-change after an external call (CEI violation).",
+    "critical",
+    ["solidity"],
+)
+def _sc006(path: Path, text: str) -> Iterable[tuple[int, str]]:
+    if _NON_REENTRANT.search(text):
+        return
+    lines = list(_iter_lines(text))
+    for idx, (line_no, line) in enumerate(lines):
+        if not _EXTERNAL_CALL.search(line):
+            continue
+        stripped = line.strip()
+        if stripped.startswith("//") or stripped.startswith("*"):
+            continue
+        for _, next_line in lines[idx + 1 : idx + 20]:
+            s = next_line.strip()
+            if not s or s.startswith("//") or s.startswith("*"):
+                continue
+            if s == "}" or s.startswith("function ") or s.startswith("modifier "):
+                break
+            if _STATE_WRITE.match(next_line):
+                yield line_no, "State change after external call (potential reentrancy)."
+                break
+
+
+_INIT_FUNC = re.compile(r"function\s+initialize\s*\(")
+_INIT_GUARD = re.compile(r"\b(initializer|onlyInitializing|reinitializer)\b")
+
+
+@rule(
+    "SC007",
+    "Unprotected initializer: initialize() without initializer/onlyInitializing.",
+    "critical",
+    ["solidity"],
+)
+def _sc007(path: Path, text: str) -> Iterable[tuple[int, str]]:
+    for line_no, line in _iter_lines(text):
+        if _INIT_FUNC.search(line) and not _INIT_GUARD.search(line):
+            yield line_no, "initialize() lacks an initializer/onlyInitializing modifier."
+
+
+_RAW_TRANSFER = re.compile(r"(?<!safe)\.(transfer|transferFrom)\s*\(")
+_SAFE_ERC20_IMPORT = re.compile(r"SafeERC20|using\s+SafeERC20")
+
+
+@rule(
+    "SC008",
+    "Unchecked ERC20 transfer: use SafeERC20.safeTransfer instead of transfer().",
+    "warning",
+    ["solidity"],
+)
+def _sc008(path: Path, text: str) -> Iterable[tuple[int, str]]:
+    if _SAFE_ERC20_IMPORT.search(text):
+        return
+    for line_no, line in _iter_lines(text):
+        stripped = line.strip()
+        if stripped.startswith("//") or stripped.startswith("*"):
+            continue
+        if _RAW_TRANSFER.search(line):
+            yield line_no, "Direct ERC20 transfer()/transferFrom(); prefer SafeERC20."
+
+
+_ONLY_PRIV = re.compile(r"\bonlyOwner\b|\bonlyRole\s*\(")
+_CRITICAL_OP = re.compile(
+    r"\b(withdraw|withdrawAll|pause|unpause|setFee|setOwner|transferOwnership|"
+    r"upgradeTo|upgradeToAndCall|sweep|emergencyWithdraw|rescue)\b"
+)
+_TIMELOCK_HINT = re.compile(r"\b(Timelock|timelock|_delay|delay\s*=|MIN_DELAY)\b")
+
+
+@rule(
+    "SC009",
+    "Centralization risk: privileged function with a critical operation and no timelock.",
+    "warning",
+    ["solidity"],
+)
+def _sc009(path: Path, text: str) -> Iterable[tuple[int, str]]:
+    if _TIMELOCK_HINT.search(text):
+        return
+    for line_no, line in _iter_lines(text):
+        if _ONLY_PRIV.search(line) and _CRITICAL_OP.search(line):
+            yield line_no, "Privileged function performs a critical op without a timelock."
+
+
+# ---------------------------------------------------------------------------
+# Extended Rust / Anchor rules (v0.2.0)
+# ---------------------------------------------------------------------------
+
+_ANCHOR_DERIVE = re.compile(r"#\[derive\s*\(\s*Accounts\s*\)\]")
+_ACCOUNT_ANNOT = re.compile(r"#\[account\s*\(")
+_ACCOUNT_FIELD = re.compile(r"\bpub\s+\w+\s*:\s*(?:AccountInfo|UncheckedAccount|Account)\s*<")
+
+
+@rule(
+    "RS003",
+    "Anchor Accounts struct without has_one/constraint annotations.",
+    "warning",
+    ["rust"],
+)
+def _rs003(path: Path, text: str) -> Iterable[tuple[int, str]]:
+    lines = list(_iter_lines(text))
+    for idx, (line_no, line) in enumerate(lines):
+        if not _ANCHOR_DERIVE.search(line):
+            continue
+        depth = 0
+        saw_field = False
+        saw_annotation = False
+        for _, nline in lines[idx + 1 : idx + 80]:
+            depth += nline.count("{") - nline.count("}")
+            if _ACCOUNT_ANNOT.search(nline):
+                saw_annotation = True
+            if _ACCOUNT_FIELD.search(nline):
+                saw_field = True
+            if saw_field and depth < 0:
+                break
+        if saw_field and not saw_annotation:
+            yield line_no, "Accounts struct has no #[account(...)] constraints."
+
+
+_SIGNER_TYPE = re.compile(r"Signer\s*<\s*'info\s*>")
+_ACCOUNT_INFO_TYPE = re.compile(r":\s*AccountInfo\s*<\s*'info\s*>")
+
+
+@rule(
+    "RS004",
+    "Missing Signer check: account declared as AccountInfo instead of Signer.",
+    "critical",
+    ["rust"],
+)
+def _rs004(path: Path, text: str) -> Iterable[tuple[int, str]]:
+    for line_no, line in _iter_lines(text):
+        if _ACCOUNT_INFO_TYPE.search(line) and not _SIGNER_TYPE.search(line):
+            yield line_no, "Account declared as AccountInfo; consider Signer<'info>'."
+
+
+# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 
@@ -176,7 +322,7 @@ def list_rules() -> list[Rule]:
     return sorted(RULES, key=lambda r: r.rule_id)
 
 
-def _iter_source_files(root: Path, exclude: Optional[Sequence[str]] = None) -> Iterator[Path]:
+def _iter_source_files(root: Path, exclude: Sequence[str] | None = None) -> Iterator[Path]:
     exclude_set = set(DEFAULT_EXCLUDES) | {e for e in (exclude or [])}
     for p in root.rglob("*"):
         if not p.is_file():
@@ -220,8 +366,8 @@ def _scan_file(path: Path, active_rules: list[Rule]) -> list[CheckFinding]:
 
 def run_checks(
     root: Path,
-    rules: Optional[Sequence[str]] = None,
-    min_severity: Optional[str] = None,
+    rules: Sequence[str] | None = None,
+    min_severity: str | None = None,
 ) -> CheckResult:
     """Run all (or selected) rules under ``root`` and return a CheckResult."""
     root = Path(root)

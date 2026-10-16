@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Optional
 
 from rich.console import Console
 from rich.table import Table
@@ -53,8 +52,8 @@ def _render_table(result) -> None:  # noqa: ANN001
 
 def run(
     path: Path = Path("."),
-    rules: Optional[List[str]] = None,
-    min_severity: Optional[str] = None,
+    rules: list[str] | None = None,
+    min_severity: str | None = None,
     json_output: bool = False,
 ) -> None:
     """Run static security checks on Solidity/Rust sources under PATH."""

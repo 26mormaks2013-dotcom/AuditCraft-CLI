@@ -9,9 +9,10 @@ reduce the line count; the line is still treated as source.
 from __future__ import annotations
 
 import json
+import re
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Optional, Sequence
 
 DEFAULT_EXCLUDES: tuple[str, ...] = (
     "node_modules",
@@ -27,7 +28,7 @@ RUST_EXTS: tuple[str, ...] = (".rs",)
 SUPPORTED_EXTS: tuple[str, ...] = SOLIDITY_EXTS + RUST_EXTS
 
 
-def _ext_to_language(path: Path) -> Optional[str]:
+def _ext_to_language(path: Path) -> str | None:
     ext = path.suffix.lower()
     if ext in SOLIDITY_EXTS:
         return "solidity"
@@ -65,7 +66,7 @@ class ScopeReport:
     def nsloc(self) -> int:
         return max(self.total - self.comments - self.blank, 0)
 
-    def finalize(self) -> "ScopeReport":
+    def finalize(self) -> ScopeReport:
         self.files = len(self.per_file)
         self.total = sum(f.total for f in self.per_file)
         self.comments = sum(f.comments for f in self.per_file)
@@ -198,7 +199,7 @@ def count_file(path: Path) -> FileScope:
     return scope
 
 
-def _iter_source_files(root: Path, include: Optional[Sequence[str]], exclude: Optional[Sequence[str]]) -> Iterable[Path]:
+def _iter_source_files(root: Path, include: Sequence[str] | None, exclude: Sequence[str] | None) -> Iterable[Path]:
     exclude_set = set(DEFAULT_EXCLUDES) | {e for e in (exclude or [])}
     include_exts = tuple(include) if include else SUPPORTED_EXTS
 
@@ -215,8 +216,8 @@ def _iter_source_files(root: Path, include: Optional[Sequence[str]], exclude: Op
 
 def count_scope(
     root: Path,
-    include: Optional[Sequence[str]] = None,
-    exclude: Optional[Sequence[str]] = None,
+    include: Sequence[str] | None = None,
+    exclude: Sequence[str] | None = None,
 ) -> ScopeReport:
     """Recursively count nSLOC under ``root``."""
     root = Path(root)
@@ -251,6 +252,164 @@ def report_to_json(report: ScopeReport) -> str:
                 "nsloc": f.nsloc,
             }
             for f in report.per_file
+        ],
+    }
+    return json.dumps(payload, indent=2, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# Cyclomatic complexity (v0.2.0)
+# ---------------------------------------------------------------------------
+
+_FUNC_SIG = re.compile(
+    r"^\s*function\s+([A-Za-z_]\w*)\s*\([^)]*\)[^{;]*\{"
+)
+_DECISION_KEYWORDS = re.compile(r"\b(if|for|while|require|assert|catch)\b")
+_TERNARY = re.compile(r"\?")
+_BOOL_AND_OR = re.compile(r"&&|\|\|")
+
+
+@dataclass
+class FunctionComplexity:
+    """Cyclomatic complexity of a single function."""
+
+    name: str
+    path: Path
+    line: int
+    complexity: int
+
+
+@dataclass
+class ComplexityReport:
+    """Aggregate cyclomatic complexity report."""
+
+    functions: list[FunctionComplexity] = field(default_factory=list)
+
+    def finalize(self) -> ComplexityReport:
+        self.functions.sort(key=lambda f: (-f.complexity, str(f.path).lower(), f.line))
+        return self
+
+    @property
+    def max_complexity(self) -> int:
+        return max((f.complexity for f in self.functions), default=0)
+
+    @property
+    def avg_complexity(self) -> float:
+        if not self.functions:
+            return 0.0
+        return sum(f.complexity for f in self.functions) / len(self.functions)
+
+
+def _strip_comments(text: str) -> str:
+    """Naive comment remover used only for complexity heuristics."""
+    out_lines: list[str] = []
+    in_block = False
+    for line in text.splitlines():
+        buf: list[str] = []
+        i = 0
+        n = len(line)
+        while i < n:
+            ch = line[i]
+            nxt = line[i + 1] if i + 1 < n else ""
+            if in_block:
+                if ch == "*" and nxt == "/":
+                    in_block = False
+                    i += 2
+                    continue
+                i += 1
+                continue
+            if ch == "/" and nxt == "*":
+                in_block = True
+                i += 2
+                continue
+            if ch == "/" and nxt == "/":
+                break
+            buf.append(ch)
+            i += 1
+        out_lines.append("".join(buf))
+    return "\n".join(out_lines)
+
+
+def _extract_functions(text: str) -> list[tuple[int, str, list[str]]]:
+    """Yield (start_line, name, body_lines) for each Solidity function."""
+    lines = text.splitlines()
+    funcs: list[tuple[int, str, list[str]]] = []
+    i = 0
+    while i < len(lines):
+        m = _FUNC_SIG.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        name = m.group(1)
+        start = i + 1
+        depth = 0
+        body: list[str] = []
+        j = i
+        while j < len(lines):
+            depth += lines[j].count("{") - lines[j].count("}")
+            body.append(lines[j])
+            if depth <= 0 and j > i:
+                break
+            j += 1
+        funcs.append((start, name, body))
+        i = j + 1
+    return funcs
+
+
+def count_function_complexity(text: str, path: Path) -> list[FunctionComplexity]:
+    """Compute cyclomatic complexity for Solidity functions in ``text``."""
+    stripped = _strip_comments(text)
+    results: list[FunctionComplexity] = []
+    for start, name, body in _extract_functions(stripped):
+        cc = 1
+        for line in body:
+            cc += len(_DECISION_KEYWORDS.findall(line))
+            cc += len(_TERNARY.findall(line))
+            cc += len(_BOOL_AND_OR.findall(line))
+        results.append(
+            FunctionComplexity(name=name, path=path, line=start, complexity=cc)
+        )
+    return results
+
+
+def count_scope_complexity(
+    root: Path,
+    include: Sequence[str] | None = None,
+    exclude: Sequence[str] | None = None,
+) -> ComplexityReport:
+    """Compute cyclomatic complexity for Solidity sources under ``root``."""
+    root = Path(root)
+    report = ComplexityReport()
+
+    paths: list[Path]
+    if root.is_file():
+        paths = [root] if root.suffix.lower() in SOLIDITY_EXTS else []
+    else:
+        paths = [p for p in _iter_source_files(root, include, exclude) if p.suffix.lower() in SOLIDITY_EXTS]
+
+    for path in paths:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        report.functions.extend(count_function_complexity(text, path))
+    return report.finalize()
+
+
+def complexity_to_json(report: ComplexityReport) -> str:
+    """Serialize a ComplexityReport to a JSON string."""
+    payload = {
+        "max_complexity": report.max_complexity,
+        "avg_complexity": round(report.avg_complexity, 2),
+        "count": len(report.functions),
+        "functions": [
+            {
+                "name": f.name,
+                "path": str(f.path),
+                "line": f.line,
+                "complexity": f.complexity,
+            }
+            for f in report.functions
         ],
     }
     return json.dumps(payload, indent=2, ensure_ascii=False)

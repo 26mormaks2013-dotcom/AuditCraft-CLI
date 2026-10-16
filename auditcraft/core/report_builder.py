@@ -4,13 +4,21 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Final
 
 from jinja2 import Environment, PackageLoader, StrictUndefined, select_autoescape
 
 from auditcraft.models.issue import ReportSummary
 
-TEMPLATE_NAME = "report_template.md.j2"
+FORMATS: Final[tuple[str, ...]] = ("markdown", "c4", "cantina")
+
+_TEMPLATES: Final[dict[str, str]] = {
+    "markdown": "report_template.md.j2",
+    "c4": "report_c4.md.j2",
+    "cantina": "report_cantina.md.j2",
+}
+
+DEFAULT_FORMAT: Final[str] = "markdown"
 
 
 def _env() -> Environment:
@@ -50,14 +58,19 @@ def load_summary(path: Path) -> ReportSummary:
     return _coerce_summary(raw)
 
 
-def build_report(summary: ReportSummary) -> str:
-    """Render the Markdown report for a ReportSummary object."""
+def build_report(summary: ReportSummary, fmt: str = DEFAULT_FORMAT) -> str:
+    """Render the Markdown report for a ReportSummary object.
+
+    ``fmt`` is one of ``markdown`` (default), ``c4`` or ``cantina``.
+    """
+    if fmt not in _TEMPLATES:
+        raise ValueError(f"Unknown report format {fmt!r}; expected one of {', '.join(FORMATS)}")
     env = _env()
-    template = env.get_template(TEMPLATE_NAME)
+    template = env.get_template(_TEMPLATES[fmt])
     counts = summary.counts_by_severity()
     return template.render(summary=summary, counts=counts)
 
 
-def build_report_from_file(path: Path) -> str:
+def build_report_from_file(path: Path, fmt: str = DEFAULT_FORMAT) -> str:
     """Load a summary JSON and render the Markdown report."""
-    return build_report(load_summary(path))
+    return build_report(load_summary(path), fmt=fmt)

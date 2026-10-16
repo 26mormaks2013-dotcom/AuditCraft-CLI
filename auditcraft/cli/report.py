@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
 
 from rich.console import Console
 from rich.table import Table
 
 from auditcraft.core.report_builder import (
+    FORMATS,
     build_report_from_file,
     load_summary,
     save_summary,
@@ -22,14 +22,14 @@ DEFAULT_SUMMARY = Path("audit_summary.json")
 DEFAULT_OUTPUT = Path("AUDIT_REPORT.md")
 
 
-def _resolve(summary_path: Optional[Path]) -> Path:
+def _resolve(summary_path: Path | None) -> Path:
     return summary_path if summary_path is not None else DEFAULT_SUMMARY
 
 
 def init_cmd(
     project: str,
-    auditor: Optional[str] = None,
-    output: Optional[Path] = None,
+    auditor: str | None = None,
+    output: Path | None = None,
 ) -> None:
     """Initialize an empty audit summary JSON."""
     out = output if output is not None else DEFAULT_SUMMARY
@@ -43,8 +43,8 @@ def add_cmd(
     severity: str = "medium",
     description: str = "",
     recommendation: str = "",
-    location: Optional[str] = None,
-    summary_path: Optional[Path] = None,
+    location: str | None = None,
+    summary_path: Path | None = None,
     non_interactive: bool = False,
 ) -> None:
     """Append a finding to the summary JSON."""
@@ -76,11 +76,19 @@ def add_cmd(
 
 
 def build_cmd(
-    summary_path: Optional[Path] = None,
-    output: Optional[Path] = None,
+    summary_path: Path | None = None,
+    output: Path | None = None,
     json_output: bool = False,
+    report_format: str = "markdown",
 ) -> None:
     """Render the Markdown audit report from the summary JSON."""
+    if report_format not in FORMATS:
+        console_err.print(
+            f"[bold red]Invalid --format:[/bold red] {report_format!r}. "
+            f"Expected one of: {', '.join(FORMATS)}."
+        )
+        raise SystemExit(2)
+
     path = _resolve(summary_path)
     summary = load_summary(path)
 
@@ -88,10 +96,10 @@ def build_cmd(
         console.print_json(summary.model_dump_json())
         return
 
-    markdown = build_report_from_file(path)
+    markdown = build_report_from_file(path, fmt=report_format)
     out = output if output is not None else DEFAULT_OUTPUT
     out.write_text(markdown, encoding="utf-8")
-    console.print(f"[bold green]Wrote report:[/bold green] {out}")
+    console.print(f"[bold green]Wrote report ({report_format}):[/bold green] {out}")
 
     table = Table(title="Findings by severity")
     table.add_column("Severity", style="bold cyan")

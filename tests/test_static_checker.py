@@ -6,7 +6,6 @@ from pathlib import Path
 
 from auditcraft.core.static_checker import RULES, list_rules, run_checks
 
-
 FLOATING_PRAGMA = """// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 contract Foo {}
@@ -54,11 +53,15 @@ RUST_ANCHOR_NO_OWNER = """pub fn initialize(ctx: Context<Init>) -> Result<()> {
 """
 
 
-def test_list_rules_returns_all_7() -> None:
+def test_list_rules_returns_all_13() -> None:
     rules = list_rules()
     ids = {r.rule_id for r in rules}
-    assert ids == {"SC001", "SC002", "SC003", "SC004", "SC005", "RS001", "RS002"}
-    assert len(RULES) >= 7
+    assert ids == {
+        "SC001", "SC002", "SC003", "SC004", "SC005",
+        "SC006", "SC007", "SC008", "SC009",
+        "RS001", "RS002", "RS003", "RS004",
+    }
+    assert len(RULES) >= 13
 
 
 def test_floating_pragma_detected(tmp_path: Path) -> None:
@@ -120,3 +123,86 @@ def test_rules_filter_and_min_severity(tmp_path: Path) -> None:
 
     criticals = run_checks(tmp_path, min_severity="critical")
     assert all(f.severity.value == "critical" for f in criticals.findings)
+
+
+REENTRANCY = """// SPDX-License-Identifier: MIT
+pragma solidity 0.8.20;
+contract R {
+    mapping(address => uint256) public bal;
+    function w() external {
+        (bool ok, ) = msg.sender.call{value: bal[msg.sender]}("");
+        require(ok);
+        bal[msg.sender] = 0;
+    }
+}
+"""
+
+
+INITIALIZER_NO_GUARD = """// SPDX-License-Identifier: MIT
+pragma solidity 0.8.20;
+contract P {
+    function initialize(address o) external { }
+}
+"""
+
+
+RAW_ERC20_TRANSFER = """// SPDX-License-Identifier: MIT
+pragma solidity 0.8.20;
+contract T {
+    function send(IERC20 t, address to) external {
+        t.transfer(to, 1);
+    }
+}
+"""
+
+
+CENTRALIZATION_RISK = """// SPDX-License-Identifier: MIT
+pragma solidity 0.8.20;
+contract C {
+    function withdraw() external onlyOwner { }
+}
+"""
+
+
+ANCHOR_NO_CONSTRAINT = """#[derive(Accounts)]
+pub struct Init<'info> {
+    pub authority: AccountInfo<'info>,
+}
+"""
+
+
+ACCOUNTINFO_INSTEAD_OF_SIGNER = """#[derive(Accounts)]
+pub struct Pay<'info> {
+    pub payer: AccountInfo<'info>,
+}
+"""
+
+
+def test_sc006_reentrancy(tmp_path: Path) -> None:
+    (tmp_path / "r.sol").write_text(REENTRANCY, encoding="utf-8")
+    assert any(f.rule_id == "SC006" for f in run_checks(tmp_path).findings)
+
+
+def test_sc007_unprotected_initializer(tmp_path: Path) -> None:
+    (tmp_path / "p.sol").write_text(INITIALIZER_NO_GUARD, encoding="utf-8")
+    assert any(f.rule_id == "SC007" for f in run_checks(tmp_path).findings)
+
+
+def test_sc008_raw_erc20_transfer(tmp_path: Path) -> None:
+    (tmp_path / "t.sol").write_text(RAW_ERC20_TRANSFER, encoding="utf-8")
+    assert any(f.rule_id == "SC008" for f in run_checks(tmp_path).findings)
+
+
+def test_sc009_centralization(tmp_path: Path) -> None:
+    (tmp_path / "c.sol").write_text(CENTRALIZATION_RISK, encoding="utf-8")
+    assert any(f.rule_id == "SC009" for f in run_checks(tmp_path).findings)
+
+
+def test_rs003_anchor_no_constraint(tmp_path: Path) -> None:
+    (tmp_path / "a.rs").write_text(ANCHOR_NO_CONSTRAINT, encoding="utf-8")
+    assert any(f.rule_id == "RS003" for f in run_checks(tmp_path).findings)
+
+
+def test_rs004_missing_signer(tmp_path: Path) -> None:
+    (tmp_path / "b.rs").write_text(ACCOUNTINFO_INSTEAD_OF_SIGNER, encoding="utf-8")
+    assert any(f.rule_id == "RS004" for f in run_checks(tmp_path).findings)
