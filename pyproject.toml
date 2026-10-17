@@ -4,20 +4,20 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "auditcraft-cli"
-version = "0.1.0"
-description = "AuditCraft CLI — automation for smart contract auditors (nSLOC scope, audit reports, static checks)."
+version = "0.2.0"
+description = "AuditCraft CLI — automation for smart contract auditors: scope (nSLOC + Cyclomatic Complexity), 13 static detectors, multi-format reports (markdown/c4/cantina), Foundry/Anchor PoC generator."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "AuditCraft Contributors" },
 ]
-keywords = ["audit", "solidity", "rust", "security", "cli", "nsloc"]
+keywords = ["audit", "solidity", "rust", "security", "cli", "nsloc", "foundry", "anchor", "code4rena", "cantina"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -45,9 +45,9 @@ auditcraft = "auditcraft.main:app"
 Homepage = "https://github.com/auditcraft/auditcraft-cli"
 Issues = "https://github.com/auditcraft/auditcraft-cli/issues"
 
-[tool.setuptools]
-packages = ["auditcraft", "auditcraft.cli", "auditcraft.core", "auditcraft.models"]
-include-package-data = true
+[tool.setuptools.packages.find]
+include = ["auditcraft*"]
+namespaces = true
 
 [tool.setuptools.package-data]
 auditcraft = ["templates/*.j2", "templates/*.md.j2"]
@@ -56,6 +56,20 @@ auditcraft = ["templates/*.j2", "templates/*.md.j2"]
 testpaths = ["tests"]
 addopts = "-ra -q"
 pythonpath = ["."]
+
+[tool.coverage.run]
+source = ["auditcraft"]
+branch = true
+omit = ["tests/*", "*/__init__.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+]
+show_missing = true
+skip_covered = false
 
 [tool.ruff]
 line-length = 100

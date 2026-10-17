@@ -13,7 +13,6 @@ from auditcraft.core.sloc_counter import (
     report_to_json,
 )
 
-
 SOLIDITY_SAMPLE = """// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 

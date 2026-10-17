@@ -12,7 +12,6 @@ Severity is a single string enum that accepts both severity vocabularies
 from __future__ import annotations
 
 from enum import Enum
-from typing import Optional
 
 from pydantic import BaseModel, Field
 
@@ -30,7 +29,7 @@ class Severity(str, Enum):
     CRITICAL = "critical"
 
     @classmethod
-    def _missing_(cls, value: object) -> Optional["Severity"]:
+    def _missing_(cls, value: object) -> Severity | None:
         if not isinstance(value, str):
             return None
         key = value.strip().lower()
@@ -59,7 +58,7 @@ class Finding(BaseModel):
     severity: Severity = Severity.MEDIUM
     description: str = ""
     recommendation: str = ""
-    location: Optional[str] = None
+    location: str | None = None
 
 
 class CheckFinding(BaseModel):
@@ -88,7 +87,7 @@ class ReportSummary(BaseModel):
     """Top-level object persisted as ``audit_summary.json``."""
 
     project: str
-    auditor: Optional[str] = None
+    auditor: str | None = None
     findings: list[Finding] = Field(default_factory=list)
 
     def counts_by_severity(self) -> dict[str, int]:
