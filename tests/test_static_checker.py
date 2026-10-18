@@ -53,15 +53,17 @@ RUST_ANCHOR_NO_OWNER = """pub fn initialize(ctx: Context<Init>) -> Result<()> {
 """
 
 
-def test_list_rules_returns_all_13() -> None:
+def test_list_rules_returns_all_18() -> None:
     rules = list_rules()
     ids = {r.rule_id for r in rules}
     assert ids == {
         "SC001", "SC002", "SC003", "SC004", "SC005",
         "SC006", "SC007", "SC008", "SC009",
+        "SC012", "SC013",
         "RS001", "RS002", "RS003", "RS004",
+        "RS005", "RS006", "RS007",
     }
-    assert len(RULES) >= 13
+    assert len(RULES) >= 18
 
 
 def test_floating_pragma_detected(tmp_path: Path) -> None:
@@ -206,3 +208,101 @@ def test_rs003_anchor_no_constraint(tmp_path: Path) -> None:
 def test_rs004_missing_signer(tmp_path: Path) -> None:
     (tmp_path / "b.rs").write_text(ACCOUNTINFO_INSTEAD_OF_SIGNER, encoding="utf-8")
     assert any(f.rule_id == "RS004" for f in run_checks(tmp_path).findings)
+
+
+# --- v0.4.0: Storage Collision, Cross-Function Reentrancy, Anchor Reinit/Duplicate/PDA ---
+
+STORAGE_COLLISION = """// SPDX-License-Identifier: MIT
+pragma solidity 0.8.20;
+contract UnsafeProxy {
+    address public implementation;
+    uint256 public value;
+    function upgrade(address target) external {
+        (bool ok, ) = target.delegatecall("");
+        require(ok);
+    }
+}
+"""
+
+CROSS_FUNCTION_REENTRANCY = """// SPDX-License-Identifier: MIT
+pragma solidity 0.8.20;
+contract Bank {
+    mapping(address => uint256) public balances;
+    function deposit() external payable {
+        balances[msg.sender] += msg.value;
+    }
+    function withdraw() external {
+        (bool ok, ) = msg.sender.call{value: balances[msg.sender]}("");
+        require(ok);
+        balances[msg.sender] = 0;
+    }
+}
+"""
+
+SAFE_PROXY_WITH_GAP = """// SPDX-License-Identifier: MIT
+pragma solidity 0.8.20;
+contract SafeProxy {
+    address public implementation;
+    uint256[49] private __gap;
+    function upgrade(address target) external {
+        (bool ok, ) = target.delegatecall("");
+        require(ok);
+    }
+}
+"""
+
+ANCHOR_REINIT = """use anchor_lang::prelude::*;
+#[derive(Accounts)]
+pub struct Init<'info> {
+    #[account(init_if_needed)]
+    pub vault: Account<'info, VaultState>,
+}
+"""
+
+ANCHOR_DUPLICATE_ACCOUNT = """use anchor_lang::prelude::*;
+#[derive(Accounts)]
+pub struct Pull<'info> {
+    #[account(mut)]
+    pub source: Account<'info, VaultState>,
+    #[account(mut)]
+    pub destination: Account<'info, VaultState>,
+}
+"""
+
+ANCHOR_PDA_SHARING = """use anchor_lang::prelude::*;
+#[derive(Accounts)]
+pub struct Vault<'info> {
+    #[account(seeds = ["vault"], bump)]
+    pub vault_pda: Account<'info, VaultState>,
+}
+"""
+
+
+def test_sc012_storage_collision(tmp_path: Path) -> None:
+    (tmp_path / "p.sol").write_text(STORAGE_COLLISION, encoding="utf-8")
+    assert any(f.rule_id == "SC012" for f in run_checks(tmp_path).findings)
+
+
+def test_sc012_not_triggered_with_gap(tmp_path: Path) -> None:
+    (tmp_path / "p.sol").write_text(SAFE_PROXY_WITH_GAP, encoding="utf-8")
+    assert not any(f.rule_id == "SC012" for f in run_checks(tmp_path).findings)
+
+
+def test_sc013_cross_function_reentrancy(tmp_path: Path) -> None:
+    (tmp_path / "b.sol").write_text(CROSS_FUNCTION_REENTRANCY, encoding="utf-8")
+    assert any(f.rule_id == "SC013" for f in run_checks(tmp_path).findings)
+
+
+def test_rs005_account_reinit(tmp_path: Path) -> None:
+    (tmp_path / "a.rs").write_text(ANCHOR_REINIT, encoding="utf-8")
+    assert any(f.rule_id == "RS005" for f in run_checks(tmp_path).findings)
+
+
+def test_rs006_duplicate_account(tmp_path: Path) -> None:
+    (tmp_path / "a.rs").write_text(ANCHOR_DUPLICATE_ACCOUNT, encoding="utf-8")
+    assert any(f.rule_id == "RS006" for f in run_checks(tmp_path).findings)
+
+
+def test_rs007_pda_sharing(tmp_path: Path) -> None:
+    (tmp_path / "a.rs").write_text(ANCHOR_PDA_SHARING, encoding="utf-8")
+    assert any(f.rule_id == "RS007" for f in run_checks(tmp_path).findings)

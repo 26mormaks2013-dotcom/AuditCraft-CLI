@@ -377,6 +377,304 @@ def _rs004(path: Path, text: str) -> Iterable[tuple[int, str]]:
 
 
 # ---------------------------------------------------------------------------
+# Extended Solidity rules (v0.4.0): storage collision & cross-function reentrancy
+# ---------------------------------------------------------------------------
+
+_STATE_VAR = re.compile(
+    r"^\s*(?:public\s+|private\s+|internal\s+|constant\s+|immutable\s+|override\s+|virtual\s+)*"
+    r"(?:uint\d*|int\d*|address(?:\s+payable)?|bool|bytes\d*|string|mapping\s*\([^)]*\)|[A-Z]\w*)\s+"
+    r"(?:public\s+|private\s+|internal\s+|constant\s+|immutable\s+|override\s+|virtual\s+)*"
+    r"(\w+)\s*(?:=|;)"
+)
+
+_CONTRACT_OPEN = re.compile(r"\b(?:abstract\s+)?contract\s+(\w+)(?:\s+is\s+[\w,\s]+)?\s*\{")
+_PROXY_HINT = re.compile(r"\bdelegatecall\b|\bProxy\b|\bUpgradeable\b")
+_GAP_HINT = re.compile(r"\b__gap\b")
+_EIP1967_HINT = re.compile(r"\b(?:eip1967|IMPLEMENTATION_SLOT|ADMIN_SLOT)\b")
+
+
+def _contract_body_end(lines: list[tuple[int, str]], start: int) -> int:
+    depth = 0
+    started = False
+    for j in range(start, len(lines)):
+        depth += lines[j][1].count("{") - lines[j][1].count("}")
+        if not started and "{" in lines[j][1]:
+            started = True
+        if started and depth <= 0:
+            return j
+    return len(lines) - 1
+
+
+@rule(
+    "SC012",
+    "Storage collision risk in proxy/upgradeable contract without EIP-1967 slots.",
+    "warning",
+    ["solidity"],
+)
+def _sc012(path: Path, text: str) -> Iterable[tuple[int, str]]:
+    code = _strip_comments(text)
+    if _GAP_HINT.search(code) or _EIP1967_HINT.search(code):
+        return
+    lines = list(_iter_lines(code))
+    i = 0
+    n = len(lines)
+    while i < n:
+        m = _CONTRACT_OPEN.search(lines[i][1])
+        if not m:
+            i += 1
+            continue
+        body_start = i
+        body_end = _contract_body_end(lines, i)
+        body_text = "\n".join(l for _, l in lines[body_start : body_end + 1])
+        if not _PROXY_HINT.search(body_text):
+            i = body_end + 1
+            continue
+        in_block = False
+        bdepth = 0
+        for j in range(body_start + 1, body_end):
+            raw = lines[j][1]
+            stripped = raw.strip()
+            if not stripped:
+                continue
+            if not in_block and re.match(r"(?:function|modifier|constructor)\b", stripped):
+                in_block = True
+                bdepth = 0
+            if in_block:
+                bdepth += raw.count("{") - raw.count("}")
+                if bdepth <= 0 and "}" in raw:
+                    in_block = False
+                continue
+            if _STATE_VAR.match(raw):
+                yield lines[j][0], (
+                    "State variable in proxy/upgradeable contract without EIP-1967 storage slot."
+                )
+                break
+        i = body_end + 1
+
+
+_FUNC_DECL2 = re.compile(r"\bfunction\s+(\w+)\s*\([^)]*\)\s*([^{;]*)\{")
+_EXT_CALL2 = re.compile(r"\.(?:call|transfer|transferFrom|send|delegatecall)\s*[\(\{]")
+_STATE_WRITE2 = re.compile(r"^\s*(\w+)\s*(?:\[[^\]]*\])?\s*(?:=|\+=|-=|\*=|/=|\+\+|--)")
+
+
+def _extract_state_vars(code: str) -> set[str]:
+    state_vars: set[str] = set()
+    depth = 0
+    for _, l in _iter_lines(code):
+        opens = l.count("{")
+        closes = l.count("}")
+        if depth == 1 and opens == 0:
+            m = _STATE_VAR.match(l)
+            if m:
+                state_vars.add(m.group(1))
+        depth += opens - closes
+    return state_vars
+
+
+@rule(
+    "SC013",
+    "Cross-function reentrancy: shared state touched across external-call boundary.",
+    "warning",
+    ["solidity"],
+)
+def _sc013(path: Path, text: str) -> Iterable[tuple[int, str]]:
+    code = _strip_comments(text)
+    if re.search(r"\bnonReentrant\b", code):
+        return
+    state_vars = _extract_state_vars(code)
+    if not state_vars:
+        return
+    lines = list(_iter_lines(code))
+    n = len(lines)
+    funcs: list[tuple[str, int, int, bool, set[str], set[str]]] = []
+    i = 0
+    while i < n:
+        m = _FUNC_DECL2.search(lines[i][1])
+        if not m:
+            i += 1
+            continue
+        name = m.group(1)
+        depth = lines[i][1].count("{") - lines[i][1].count("}")
+        j = i
+        while j < n and depth > 0:
+            j += 1
+            if j >= n:
+                break
+            depth += lines[j][1].count("{") - lines[j][1].count("}")
+        body_lines = lines[i : j + 1]
+        body_text = "\n".join(l for _, l in body_lines)
+        has_call = bool(_EXT_CALL2.search(body_text))
+        writes: set[str] = set()
+        for _, l in body_lines:
+            wm = _STATE_WRITE2.match(l)
+            if wm and wm.group(1) in state_vars:
+                writes.add(wm.group(1))
+        reads = {sv for sv in state_vars if re.search(rf"\b{re.escape(sv)}\b", body_text)}
+        funcs.append((name, i, j, has_call, writes, reads))
+        i = j + 1
+    for a_name, a_s, _, a_call, a_writes, _ in funcs:
+        if a_call or not a_writes:
+            continue
+        for b_name, _, _, b_call, b_writes, b_reads in funcs:
+            if a_name == b_name or not b_call:
+                continue
+            shared = a_writes & (b_reads | b_writes)
+            if shared:
+                yield lines[a_s][0], (
+                    f"Cross-function reentrancy: '{a_name}' writes {sorted(shared)}; "
+                    f"'{b_name}' performs external call and touches same state."
+                )
+                break
+
+
+# ---------------------------------------------------------------------------
+# Extended Solana / Anchor rules (v0.4.0)
+# ---------------------------------------------------------------------------
+
+
+def _iter_account_attrs(lines: list[tuple[int, str]]) -> Iterator[tuple[int, str, str]]:
+    """Yield (line_no, full_attr_text, following_field_line) for every #[account(...)]."""
+    i = 0
+    n = len(lines)
+    while i < n:
+        raw = lines[i][1]
+        if "#[account" not in raw:
+            i += 1
+            continue
+        buf = raw
+        pdepth = raw.count("(") - raw.count(")")
+        j = i
+        while pdepth > 0 and j + 1 < n:
+            j += 1
+            buf += "\n" + lines[j][1]
+            pdepth += lines[j][1].count("(") - lines[j][1].count(")")
+        field_line = ""
+        k = j + 1
+        while k < n and not lines[k][1].strip():
+            k += 1
+        if k < n:
+            field_line = lines[k][1]
+        yield lines[i][0], buf, field_line
+        i = j + 1
+
+
+_INIT_IF_NEEDED = re.compile(r"\binit_if_needed\b")
+_ACCOUNT_INIT = re.compile(r"\binit\b")
+_CLOSE_GUARD = re.compile(r"\bclose\s*=")
+_HAS_ONE_GUARD = re.compile(r"\bhas_one\b|\bconstraint\s*=")
+
+
+@rule(
+    "RS005",
+    "Account Reinitialization: init_if_needed without reinit guard / has_one.",
+    "critical",
+    ["rust"],
+)
+def _rs005(path: Path, text: str) -> Iterable[tuple[int, str]]:
+    code = _strip_comments(text)
+    if _HAS_ONE_GUARD.search(code):
+        return
+    for line_no, attr, field in _iter_account_attrs(list(_iter_lines(code))):
+        if _INIT_IF_NEEDED.search(attr) and not _CLOSE_GUARD.search(attr):
+            yield line_no, (
+                "Account uses init_if_needed without has_one/close; "
+                "reinitialization attack possible."
+            )
+            continue
+        if _ACCOUNT_INIT.search(attr) and "init_if_needed" not in attr:
+            if "payer" not in attr and "space" not in attr and field.strip():
+                yield line_no, (
+                    "Account declared init without payer/space; "
+                    "may be reinitialized if the account already exists."
+                )
+
+
+@rule(
+    "RS006",
+    "Duplicate Account Pass: same account used for two distinct roles.",
+    "warning",
+    ["rust"],
+)
+def _rs006(path: Path, text: str) -> Iterable[tuple[int, str]]:
+    code = _strip_comments(text)
+    lines = list(_iter_lines(code))
+    i = 0
+    n = len(lines)
+    while i < n:
+        if not _ANCHOR_DERIVE.search(lines[i][1]):
+            i += 1
+            continue
+        depth = 0
+        started = False
+        fields: list[tuple[int, str, str]] = []
+        j = i + 1
+        while j < n:
+            raw = lines[j][1]
+            depth += raw.count("{") - raw.count("}")
+            if not started and "{" in raw:
+                started = True
+            if started:
+                m = re.search(r"\bpub\s+(\w+)\s*:\s*([A-Za-z_]\w*(?:\s*<[^>]*>)?)", raw)
+                if m:
+                    fields.append((lines[j][0], m.group(1), m.group(2)))
+            if started and depth <= 0:
+                break
+            j += 1
+        by_type: dict[str, list[tuple[int, str]]] = {}
+        for line_no, name, ftype in fields:
+            base = re.split(r"\s*<", ftype, 1)[0].strip()
+            if base in {"Signer", "AccountInfo", "UncheckedAccount"}:
+                continue
+            by_type.setdefault(base, []).append((line_no, name))
+        for base, occurrences in by_type.items():
+            if len(occurrences) >= 2 and base in {"Account", "Program", "SystemAccount", "InterfaceAccount", "Interface"}:
+                first_line = occurrences[0][0]
+                window_start = max(0, first_line - 25)
+                window = "\n".join(l for _, l in lines[window_start:first_line + 5])
+                if re.search(r"\bconstraint\s*=\s*[^,)]*!=\s*[^,)]*key\(\)", window):
+                    continue
+                yield first_line, (
+                    f"Duplicate account type {base} used for roles: "
+                    f"{', '.join(name for _, name in occurrences)}; add constraint !="
+                )
+        i = j + 1
+
+
+_SEED_LITERAL = re.compile(r"\bseeds\s*=\s*\[([^\]]*)\]")
+
+
+@rule(
+    "RS007",
+    "PDA Sharing: seeds do not include a unique discriminator (state/user).",
+    "warning",
+    ["rust"],
+)
+def _rs007(path: Path, text: str) -> Iterable[tuple[int, str]]:
+    code = _strip_comments(text)
+    lines = list(_iter_lines(code))
+    for line_no, attr, field in _iter_account_attrs(lines):
+        if "seeds" not in attr:
+            continue
+        m = _SEED_LITERAL.search(attr)
+        if not m:
+            continue
+        seed_body = m.group(1)
+        parts = [p.strip() for p in seed_body.split(",") if p.strip()]
+        if len(parts) <= 1:
+            if parts and re.fullmatch(r'"[^"]*"|b"[^"]*"', parts[0]):
+                yield line_no, (
+                    "PDA seeds contain only a single literal; use a state/user-specific key."
+                )
+            continue
+        has_key = any(".key()" in p or "as_ref()" in p for p in parts)
+        if not has_key and all(re.fullmatch(r'"[^"]*"|b"[^"]*"|bump', p) for p in parts):
+            yield line_no, (
+                "PDA seeds contain only literals/bump; "
+                "shared across instructions — PDA sharing risk."
+            )
+
+
+# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 

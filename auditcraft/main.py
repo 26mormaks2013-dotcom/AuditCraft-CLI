@@ -11,6 +11,9 @@ from rich.panel import Panel
 
 from auditcraft import __version__
 from auditcraft.cli import check as check_mod
+from auditcraft.cli import graph as graph_mod
+from auditcraft.cli import diff as diff_mod
+from auditcraft.cli import export as export_mod
 from auditcraft.cli import poc as poc_mod
 from auditcraft.cli import report as report_mod
 from auditcraft.cli import scope as scope_mod
@@ -145,6 +148,51 @@ poc_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(poc_app, name="poc")
+app.add_typer(graph_mod.graph_app, name="graph")
+
+@app.command("diff")
+def diff_cmd(
+    old_path: str = typer.Argument(..., help="Old source tree (file or directory)."),
+    new_path: str = typer.Argument(..., help="New source tree (file or directory)."),
+    output: str | None = typer.Option(None, "--output", "-o", help="Write Markdown report to this file."),
+    rules: list[str] | None = typer.Option(None, "--rules", help="Only run these rule ids (repeatable)."),
+    min_severity: str | None = typer.Option(None, "--min-severity", help="Minimum severity: info|warning|critical."),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
+) -> None:
+    """Compare two source trees and render a Fix-Review Delta Report."""
+    from pathlib import Path
+
+    diff_mod.run(
+        old_path=Path(old_path),
+        new_path=Path(new_path),
+        output=Path(output) if output else None,
+        rules=rules,
+        min_severity=min_severity,
+        json_output=json_output,
+    )
+
+@app.command("export")
+def export_cmd(
+    path: str = typer.Argument(..., help="Source tree (file or directory)."),
+    platform: str = typer.Option("sherlock", "--platform", "-p", help="sherlock | code4rena | cantina"),
+    output: str | None = typer.Option(None, "--output", "-o", help="Output ZIP path."),
+    project: str = typer.Option("auditcraft", "--project", help="Project name for the summary."),
+    rules: list[str] | None = typer.Option(None, "--rules", help="Only run these rule ids (repeatable)."),
+    min_severity: str | None = typer.Option(None, "--min-severity", help="Minimum severity: info|warning|critical."),
+) -> None:
+    """Run static checks and export findings as a contest-ready ZIP."""
+    from pathlib import Path
+
+    export_mod.run(
+        path=Path(path),
+        platform=platform,
+        output=Path(output) if output else None,
+        project=project,
+        rules=rules,
+        min_severity=min_severity,
+    )
+
+
 
 
 @poc_app.command("generate")
