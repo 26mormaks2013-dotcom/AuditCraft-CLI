@@ -72,6 +72,22 @@ def _iter_lines(text: str) -> Iterator[tuple[int, str]]:
         yield idx, line
 
 
+def _strip_comments(text: str) -> str:
+    """Remove // line comments and /* */ block comments from source text.
+
+    File-wide guard heuristics scan the returned string for tokens such as
+    ``onlyOwner``, ``SafeERC20``, ``timelock`` or ``has_one``. When those
+    tokens appear only inside comments / documentation (typical for our
+    demonstration contracts, which describe what's missing), the guard
+    would silently suppress a real finding. Stripping comments first
+    ensures only executable code is searched. Line numbers in the result
+    are NOT preserved — use this only for boolean presence checks.
+    """
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    text = re.sub(r"//[^\n]*", "", text)
+    return text
+
+
 # ---------------------------------------------------------------------------
 # Solidity rules
 # ---------------------------------------------------------------------------
@@ -96,28 +112,36 @@ def _sc002(path: Path, text: str) -> Iterable[tuple[int, str]]:
         stripped = line.strip()
         if stripped.startswith("//") or stripped.startswith("*"):
             continue
-        if _UNCHECKED_CALL.search(line) and not re.search(r"\b(require|assert|bool\s+\w+\s*=)", line):
+        if _UNCHECKED_CALL.search(line) and not re.search(r"\b(require|assert|bool\s+\w+\s*[,)=])", line):
             yield line_no, "Low-level call result is not checked."
-        if _TRANSFER.search(line):
+        if _TRANSFER.search(line) and not re.search(r"\b(require|assert|bool\s+\w+\s*[,)=])", line):
             yield line_no, "transfer() return value is ignored (use call + require)."
 
 
 @rule("SC003", "selfdestruct without an access-control guard.", "critical", ["solidity"])
 def _sc003(path: Path, text: str) -> Iterable[tuple[int, str]]:
-    guarded = re.search(r"\b(onlyOwner|onlyAdmin|onlyRole|require\s*\(\s*msg\.sender)", text)
+    code = _strip_comments(text)
+    guarded = re.search(r"\b(onlyOwner|onlyAdmin|onlyRole|require\s*\(\s*msg\.sender)", code)
     if guarded:
         return
     for line_no, line in _iter_lines(text):
+        stripped = line.strip()
+        if stripped.startswith("//") or stripped.startswith("*"):
+            continue
         if "selfdestruct" in line:
             yield line_no, "selfdestruct() reached without visible access control."
 
 
 @rule("SC004", "delegatecall to an untrusted target.", "critical", ["solidity"])
 def _sc004(path: Path, text: str) -> Iterable[tuple[int, str]]:
-    guarded = re.search(r"\b(onlyOwner|onlyAdmin|onlyRole|require\s*\(\s*msg\.sender)", text)
+    code = _strip_comments(text)
+    guarded = re.search(r"\b(onlyOwner|onlyAdmin|onlyRole|require\s*\(\s*msg\.sender)", code)
     if guarded:
         return
     for line_no, line in _iter_lines(text):
+        stripped = line.strip()
+        if stripped.startswith("//") or stripped.startswith("*"):
+            continue
         if ".delegatecall(" in line:
             yield line_no, "delegatecall() without visible access control on target."
 
@@ -158,10 +182,14 @@ _OWNER_GUARD = re.compile(r"has_one\s*=\s*owner|constraint\s*=\s*.*owner|require
 
 @rule("RS002", "Anchor instruction without an owner/authority constraint.", "critical", ["rust"])
 def _rs002(path: Path, text: str) -> Iterable[tuple[int, str]]:
-    has_guard = bool(_OWNER_GUARD.search(text))
+    code = _strip_comments(text)
+    has_guard = bool(_OWNER_GUARD.search(code))
     if has_guard:
         return
     for line_no, line in _iter_lines(text):
+        stripped = line.strip()
+        if stripped.startswith("//") or stripped.startswith("*"):
+            continue
         if _ANCHOR_INSTR.search(line):
             yield line_no, "Anchor instruction lacks an owner/authority constraint."
 
@@ -229,7 +257,8 @@ _SAFE_ERC20_IMPORT = re.compile(r"SafeERC20|using\s+SafeERC20")
     ["solidity"],
 )
 def _sc008(path: Path, text: str) -> Iterable[tuple[int, str]]:
-    if _SAFE_ERC20_IMPORT.search(text):
+    code = _strip_comments(text)
+    if _SAFE_ERC20_IMPORT.search(code):
         return
     for line_no, line in _iter_lines(text):
         stripped = line.strip()
@@ -254,9 +283,13 @@ _TIMELOCK_HINT = re.compile(r"\b(Timelock|timelock|_delay|delay\s*=|MIN_DELAY)\b
     ["solidity"],
 )
 def _sc009(path: Path, text: str) -> Iterable[tuple[int, str]]:
-    if _TIMELOCK_HINT.search(text):
+    code = _strip_comments(text)
+    if _TIMELOCK_HINT.search(code):
         return
     for line_no, line in _iter_lines(text):
+        stripped = line.strip()
+        if stripped.startswith("//") or stripped.startswith("*"):
+            continue
         if _ONLY_PRIV.search(line) and _CRITICAL_OP.search(line):
             yield line_no, "Privileged function performs a critical op without a timelock."
 
@@ -281,19 +314,50 @@ def _rs003(path: Path, text: str) -> Iterable[tuple[int, str]]:
     for idx, (line_no, line) in enumerate(lines):
         if not _ANCHOR_DERIVE.search(line):
             continue
+        # Locate the body of the Accounts struct: start at the first '{' after
+        # the derive attribute, end when brace depth returns to 0.
         depth = 0
+        in_body = False
+        body_start = -1
+        body_end = -1
         saw_field = False
-        saw_annotation = False
-        for _, nline in lines[idx + 1 : idx + 80]:
+        for j in range(idx + 1, min(len(lines), idx + 200)):
+            nline = lines[j][1]
             depth += nline.count("{") - nline.count("}")
-            if _ACCOUNT_ANNOT.search(nline):
-                saw_annotation = True
+            if not in_body and "{" in nline:
+                in_body = True
+                body_start = j
+            if not in_body:
+                continue
             if _ACCOUNT_FIELD.search(nline):
                 saw_field = True
-            if saw_field and depth < 0:
+            if depth <= 0:
+                body_end = j
                 break
-        if saw_field and not saw_annotation:
-            yield line_no, "Accounts struct has no #[account(...)] constraints."
+        if body_start < 0 or body_end < 0 or not saw_field:
+            continue
+        # Look for has_one / constraint inside any #[account(...)] attribute
+        # within the struct body. Plain #[account(mut)] does NOT count.
+        saw_constraint = False
+        i = body_start
+        while i < body_end:
+            sline = lines[i][1]
+            if re.search(r"#\[account\s*\(", sline):
+                buf = sline
+                pdepth = sline.count("(") - sline.count(")")
+                k = i + 1
+                while pdepth > 0 and k < body_end:
+                    buf += "\n" + lines[k][1]
+                    pdepth += lines[k][1].count("(") - lines[k][1].count(")")
+                    k += 1
+                if re.search(r"\bhas_one\b|\bconstraint\b", buf):
+                    saw_constraint = True
+                    break
+                i = k
+            else:
+                i += 1
+        if not saw_constraint:
+            yield line_no, "Accounts struct has no has_one/constraint annotations."
 
 
 _SIGNER_TYPE = re.compile(r"Signer\s*<\s*'info\s*>")

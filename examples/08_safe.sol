@@ -15,6 +15,7 @@ interface IERC20 {
 
 library SafeERC20 {
     function safeTransfer(IERC20 token, address to, uint256 amount) internal {
+        require(to != address(0), "zero address");
         require(token.transfer(to, amount), "safeTransfer failed");
     }
 }
